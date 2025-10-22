@@ -3,7 +3,7 @@ import json
 import time
 import random
 
-API_KEY = "YOUR_API_KEY" # Insert your API-key here
+API_KEY = "1b3483017a437b7920add1855664d43b"
 BASE_URL = "https://www.foodrepo.org/api/v3/products"
 
 HEADERS = {
@@ -52,11 +52,15 @@ def fetch_all_products(page_size=100, delay=0.5, max_pages=None, output_file="fo
                    product.get("display_name_translations", {}).get("en", "Not found")
             raw_images = product.get("images", [])
             images = [img.get("large") for img in raw_images if "large" in img]
+            created_at = product.get("created_at") or "Not found"
+            updated_at = product.get("updated_at") or "Not found"
 
             all_products.append({
                 "barcode": barcode,
                 "name": name,
-                "image_links": images
+                "image_links": images,
+                "created_at": created_at,
+                "updated_at": updated_at
             })
 
         print(f"Page {page} loaded ({len(products)} products)")
@@ -86,4 +90,4 @@ def fetch_all_products(page_size=100, delay=0.5, max_pages=None, output_file="fo
 
 # Run the parser
 if __name__ == "__main__":
-    fetch_all_products(page_size=200, delay=1.0, lang="en")
+    fetch_all_products(page_size=200, output_file="foodrepo_data.json", lang="en")
