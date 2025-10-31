@@ -3,7 +3,7 @@ import json
 import time
 import random
 
-API_KEY = "1b3483017a437b7920add1855664d43b"
+API_KEY = "YOUR_API_KEY"
 BASE_URL = "https://www.foodrepo.org/api/v3/products"
 
 HEADERS = {

@@ -2,19 +2,39 @@ import httpx
 import asyncio
 import json
 import os
+import logging
+import random
+import re
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Any, List, Dict
 
+# === CONFIG ===
 BARBASE_API = "https://bb.solutionary.me/api/v1"
-# API_KEY = os.getenv("BARBASE_API_KEY", "YOUR_SECRET_TOKEN")
-API_KEY = "YOUR_API_KEY"
-STATE_FILE = "sync_state_v1.json"
-FOODREPO_FILE = "foodrepo_data.json"
+API_KEY = "d9997c62-6b0c-4f61-9c7e-decae5d968a3"
+STATE_FILE = "data/sync_state_v2.json"
+FOODREPO_FILE = "data/foodrepo.json"
 
 HEADERS = {
     "Content-Type": "application/json",
     "X-API-Key": API_KEY
 }
+
+MAX_CONCURRENT = 10        # Number of parallel tasks
+SAVE_EVERY = 10_000        # Save progress every N entries
+RETRIES = 5                # Attempts in case of network/API error
+
+# === LOGGING SETUP ===
+LOG_FILE = "data/sync.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
 
 
 # === HELPERS ===
@@ -30,28 +50,39 @@ def save_json(filename: str, data: Any):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+async def with_retries(func, *args, retries=RETRIES, base_delay=1.0, max_delay=10.0, **kwargs):
+    """Repeats the function with an exponential delay in case of an error."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            delay = min(base_delay * 2 ** (attempt - 1), max_delay)
+            delay += random.uniform(0, 0.5)
+            log.warning(f"{func.__name__}: attempt {attempt}/{retries} failed ({e}). Retrying in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+    log.error(f"{func.__name__}: all {retries} attempts failed.")
+    return None
+
+
+# === API CALLS ===
 async def check_barbase_product(client: httpx.AsyncClient, barcode: str) -> httpx.Response:
-    """Проверяем, есть ли товар в Barbase."""
-    url = f"{BARBASE_API}/barcodes/{barcode}"
-    return await client.get(url, headers=HEADERS, params={"page": 0, "per_page": 0})
+    return await client.get(f"{BARBASE_API}/barcodes/{barcode}", headers=HEADERS)
 
 
 async def create_barbase_product(client: httpx.AsyncClient, product: dict) -> bool:
-    """Создаём новый продукт (если его нет в базе)."""
     body = {
         "barcode": product["barcode"],
         "external_user_id": None,
-        "images": product.get("image_links", []),
+        "images": product.get("image_links") or ["https://barbase.solutionary.me/empty.jpg"],
         "language_id": None,
         "name": product["name"]
     }
     resp = await client.post(f"{BARBASE_API}/products", headers=HEADERS, json=body)
     if resp.status_code == 201:
-        print(f"[+] Created new product {product['name']} ({product['barcode']})")
+        log.info(f"[+] Created new product {product['name']} ({product['barcode']})")
         return True
-    else:
-        print(f"[ERROR {resp.status_code}] Failed to create {product['barcode']}: {resp.text}")
-        return False
+    log.error(f"[{resp.status_code}] Failed to create {product['barcode']}: {resp.text}")
+    return False
 
 
 async def add_barbase_name(client: httpx.AsyncClient, product_id: int, name: str):
@@ -63,87 +94,109 @@ async def add_barbase_name(client: httpx.AsyncClient, product_id: int, name: str
     }
     resp = await client.post(f"{BARBASE_API}/names", headers=HEADERS, json=body)
     if resp.status_code == 201:
-        print(f"[+] Added name '{name}' to product {product_id}")
+        log.info(f"[+] Added name '{name}' to product {product_id}")
     else:
-        print(f"[WARN] Could not add name ({resp.status_code})")
+        log.warning(f"[WARN] Could not add name ({resp.status_code})")
 
 
 async def add_barbase_images(client: httpx.AsyncClient, product_id: int, images: List[str]):
-    for url in images:
-        body = {
-            "external_user_id": None,
-            "product_id": product_id,
-            "url": url
-        }
-        resp = await client.post(f"{BARBASE_API}/images", headers=HEADERS, json=body)
-        if resp.status_code == 201:
-            print(f"[+] Added image {url} to product {product_id}")
+    if images:
+        for url in images:
+            body = {"external_user_id": None, "product_id": product_id, "url": url}
+            resp = await client.post(f"{BARBASE_API}/images", headers=HEADERS, json=body)
+            if resp.status_code == 201:
+                log.info(f"[+] Added image {url} to product {product_id}")
+            else:
+                log.warning(f"[WARN] Could not add image ({resp.status_code})")
+    log.warning(f"[WARN] Could not find images for ({product_id})")
+
+
+# === CORE ===
+SEM = asyncio.Semaphore(MAX_CONCURRENT)
+
+async def process_product(client, product, state, updated_state):
+    async with SEM:
+        barcode = str(product.get("barcode", "")).strip()
+
+        if not barcode or barcode.lower() in ("not found", "none"):
+            return
+
+        # Clean barcodes of debris
+        barcode = re.sub(r'[^\x20-\x7E]', '', str(barcode)).strip()
+
+        # Skip incorrect barcodes
+        if not barcode.isdigit() or len(barcode) < 5:
+            log.warning(f"Skipping invalid barcode: {barcode!r}")
+            return
+
+        created_at = product.get("created_at")
+        updated_at = product.get("updated_at")
+
+        prev = state.get(barcode)
+        if prev and (prev.get("updated_at") == updated_at or prev.get("created_at") == created_at):
+            log.debug(f"{barcode}: already synced, skipping.")
+            return
+
+        resp = await with_retries(check_barbase_product, client, barcode)
+        if not resp:
+            log.error(f"[ERROR] Failed to check {barcode} after retries.")
+            return
+
+        if resp.status_code == 200:
+            data = resp.json()
+            product_id = data["data"][0]["products"][0]["id"]
+            await with_retries(add_barbase_name, client, product_id, product["name"])
+            await with_retries(add_barbase_images, client, product_id, product.get("image_links", []))
+            status = "updated"
+
+        elif resp.status_code == 404:
+            await with_retries(create_barbase_product, client, product)
+            status = "uploaded"
+
         else:
-            print(f"[WARN] Could not add image ({resp.status_code})")
+            log.error(f"[ERROR] Unexpected response {resp.status_code} for {barcode}")
+            return
+
+        updated_state[barcode] = {
+            "barcode": barcode,
+            "status": status,
+            "last_posted": datetime.now(timezone.utc).isoformat(),
+            "created_at": created_at,
+            "updated_at": updated_at
+        }
+
+        if len(updated_state) % SAVE_EVERY == 0:
+            save_json(STATE_FILE, updated_state)
+            log.info(f"[STATE] Progress saved ({len(updated_state)} records)")
 
 
-# === MAIN SYNC ===
 async def sync_products():
-    """Основной процесс: сверяет FoodRepo и Barbase."""
     state = load_json(STATE_FILE)
     updated_state = state.copy()
 
-    # Загружаем все продукты из FoodRepo
     if not os.path.exists(FOODREPO_FILE):
-        print("[ERROR] File foodrepo_data.json not found — run parser first!")
+        log.error("[ERROR] File foodrepo_data.json not found — run parser first!")
         return
 
     food_products = load_json(FOODREPO_FILE)
-    print(f"[INFO] Loaded {len(food_products)} products from FoodRepo")
+    log.info(f"[INFO] Loaded {len(food_products)} products from FoodRepo")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for product in food_products:
-            barcode = product["barcode"]
+        tasks = []
+        for idx, product in enumerate(food_products, start=1):
+            task = process_product(client, product, state, updated_state)
+            tasks.append(task)
 
-            # игнорируем некорректные
-            if barcode in ("", "Not found", None):
-                continue
+        await asyncio.gather(*tasks)
 
-            created_at = product["created_at"]
-            updated_at = product["updated_at"]
-
-            prev = state.get(barcode)
-            if prev and prev["updated_at"] == updated_at:
-                print(f"[=] {barcode}: already synced, skipping.")
-                continue
-
-            # Проверяем наличие продукта в Barbase
-            resp = await check_barbase_product(client, barcode)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                product_id = data["data"][0]["products"][0]["id"]
-
-                # добавляем имя и картинки (дополняем!)
-                await add_barbase_name(client, product_id, product["name"])
-                await add_barbase_images(client, product_id, product.get("image_links", []))
-                status = "updated"
-
-            elif resp.status_code == 404:
-                # создаём новый
-                await create_barbase_product(client, product)
-                status = "uploaded"
-
-            else:
-                print(f"[ERROR] Unexpected response {resp.status_code} for {barcode}")
-                continue
-
-            updated_state[barcode] = {
-                "barcode": barcode,
-                "status": status,
-                "last_posted": datetime.now(timezone.utc).isoformat(),
-                "created_at": created_at,
-                "updated_at": updated_at
-            }
-
+        save_json(STATE_FILE, updated_state)
+        log.info("[STATE] Final state saved")
     save_json(STATE_FILE, updated_state)
-    print("\n[✔] Sync complete!")
+    log.info("[✔] Sync complete!")
 
 
 if __name__ == "__main__":
-    asyncio.run(sync_products())
+    try:
+        asyncio.run(sync_products())
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user. Saving state...")
