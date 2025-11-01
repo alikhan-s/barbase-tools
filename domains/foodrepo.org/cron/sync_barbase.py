@@ -6,13 +6,13 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
-from typing import Any, List, Dict
+from typing import Any, List
 
 # === CONFIG ===
 BARBASE_API = "https://bb.solutionary.me/api/v1"
 API_KEY = "d9997c62-6b0c-4f61-9c7e-decae5d968a3"
 STATE_FILE = "data/sync_state_v2.json"
-FOODREPO_FILE = "data/foodrepo.json"
+FOODREPO_FILE = "data/foodrepo_data.json"
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -108,7 +108,8 @@ async def add_barbase_images(client: httpx.AsyncClient, product_id: int, images:
                 log.info(f"[+] Added image {url} to product {product_id}")
             else:
                 log.warning(f"[WARN] Could not add image ({resp.status_code})")
-    log.warning(f"[WARN] Could not find images for ({product_id})")
+    else:
+        log.warning(f"[WARN] Could not find images for ({product_id})")
 
 
 # === CORE ===
@@ -191,7 +192,6 @@ async def sync_products():
 
         save_json(STATE_FILE, updated_state)
         log.info("[STATE] Final state saved")
-    save_json(STATE_FILE, updated_state)
     log.info("[✔] Sync complete!")
 
 
