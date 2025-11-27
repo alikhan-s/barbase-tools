@@ -20,6 +20,7 @@ def fetch_all_products(page_size=100, delay=0.5, max_pages=None, output_file="fo
 
     while True:
         params = {
+            "excludes": "ingredients_translations,status,quantity,unit,hundred_unit,portion_quantity,portion_unit,alcohol_by_volume,nutrients",
             "page[number]": page, # current page
             "page[size]": page_size # number of products per page
         }
