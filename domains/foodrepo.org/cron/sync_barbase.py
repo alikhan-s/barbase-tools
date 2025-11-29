@@ -10,7 +10,7 @@ from typing import Any, List
 
 # === CONFIG ===
 BARBASE_API = "https://bb.solutionary.me/api/v1"
-API_KEY = "d9997c62-6b0c-4f61-9c7e-decae5d968a3"
+API_KEY = "YOUR_API_KEY"
 STATE_FILE = "data/sync_state_v2.json"
 FOODREPO_FILE = "data/foodrepo_data.json"
 
