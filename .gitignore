@@ -140,3 +140,6 @@ vite.config.ts.timestamp-*
 
 # PyCharm
 .idea/
+
+# Large files
+domains/world.openfoodfacts.org/another_implementation/products.json
